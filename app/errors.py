@@ -37,3 +37,19 @@ class StalePreviewError(ReconciliationError):
 
 class PublishError(ReconciliationError):
     code = "publish_error"
+
+
+class DeliveryError(ReconciliationError):
+    """A delivery order could not be produced; nothing was recorded."""
+
+    code = "delivery_error"
+
+
+class MissingPeriodsError(DeliveryError):
+    """The applicable snapshot has no data for one or more requested periods."""
+
+    code = "delivery_missing_periods"
+
+    def __init__(self, message: str, missing: list[dict]) -> None:
+        super().__init__(message)
+        self.missing = missing

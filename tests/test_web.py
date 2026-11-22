@@ -155,3 +155,108 @@ def test_upload_to_missing_dataset_renders_error_page(client):
     )
     assert resp.status_code == 400
     assert "操作失败" in resp.text
+
+
+# ----------------------------------------------------------------------
+# Delivery (scheduler CSV hand-off)
+# ----------------------------------------------------------------------
+def test_delivery_page_and_csv(client):
+    ds = ready(client)
+    preview = client.post(f"/api/datasets/{ds}/preview").json()
+    client.post(f"/api/datasets/{ds}/publish", json={"preview_id": preview["preview_id"]})
+
+    page = client.get(f"/datasets/{ds}")
+    assert page.status_code == 200
+    assert "交付排产（CSV）" in page.text
+
+    resp = client.post(
+        f"/datasets/{ds}/deliver", data={"periods": "2026-01"}, follow_redirects=False
+    )
+    assert resp.status_code == 303
+    assert "delivered=1" in resp.headers["location"]
+
+    csv_resp = client.get(f"/datasets/{ds}/deliveries/1/download")
+    assert csv_resp.status_code == 200
+    assert csv_resp.headers["content-type"].startswith("text/csv")
+    header = csv_resp.text.splitlines()[0]
+    assert header.strip("﻿") == (
+        "period,line_id,line_name,corrected_value,snapshot_version"
+    )
+    assert "2026-01,L1" in csv_resp.text
+    assert "2026-01,L2" in csv_resp.text
+    assert "2026-01,L3" in csv_resp.text
+
+    # The page now shows the lock and the order.
+    page = client.get(f"/datasets/{ds}")
+    assert "已交付快照锁定" in page.text
+    assert "下载 CSV" in page.text
+
+
+def test_delivery_preview_page_reports_missing_periods(client):
+    ds = ready(client)
+    preview = client.post(f"/api/datasets/{ds}/preview").json()
+    client.post(f"/api/datasets/{ds}/publish", json={"preview_id": preview["preview_id"]})
+    resp = client.post(
+        f"/datasets/{ds}/deliver/preview", data={"periods": "2026-01,2026-09"}
+    )
+    assert resp.status_code == 200
+    assert "2026-09" in resp.text
+    assert "不存在" in resp.text
+
+
+def test_delivery_missing_period_returns_400_and_lists_it(client):
+    ds = ready(client)
+    preview = client.post(f"/api/datasets/{ds}/preview").json()
+    client.post(f"/api/datasets/{ds}/publish", json={"preview_id": preview["preview_id"]})
+
+    resp = client.post(f"/api/datasets/{ds}/deliver", json={"periods": ["2026-01", "2026-09"]})
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["code"] == "delivery_missing_periods"
+    assert [m["period"] for m in body["missing"]] == ["2026-09"]
+    # Nothing was recorded.
+    assert client.get(f"/api/datasets/{ds}/deliveries").json() == []
+
+    form = client.post(
+        f"/datasets/{ds}/deliver",
+        data={"periods": "2026-01,2026-09"},
+        follow_redirects=False,
+    )
+    assert form.status_code == 400
+    assert "整单已退回" in form.text
+    assert "2026-09" in form.text
+
+    snapshot = client.get(f"/api/datasets/{ds}/snapshots").json()[0]
+    assert snapshot["version_number"] == 1
+
+
+def test_delivery_reuses_first_snapshot_across_publish(client):
+    ds = ready(client)
+    p1 = client.post(f"/api/datasets/{ds}/preview").json()
+    client.post(f"/api/datasets/{ds}/publish", json={"preview_id": p1["preview_id"]})
+    first = client.post(f"/api/datasets/{ds}/deliver", json={"periods": ["2026-01"]}).json()
+    first_csv = client.get(f"/datasets/{ds}/deliveries/{first['order_id']}/download").text
+
+    # Change inputs, publish v2.
+    upload(client, ds, "published", PUBLISHED.replace("66", "80"))
+    p2 = client.post(f"/api/datasets/{ds}/preview").json()
+    client.post(f"/api/datasets/{ds}/publish", json={"preview_id": p2["preview_id"]})
+
+    again = client.post(f"/api/datasets/{ds}/deliver", json={"periods": ["2026-01"]}).json()
+    assert again["versions"] == {"2026-01": 1}
+    again_csv = client.get(f"/datasets/{ds}/deliveries/{again['order_id']}/download").text
+    assert again_csv == first_csv
+
+
+def test_delivery_api_preview_is_read_only(client):
+    ds = ready(client)
+    p = client.post(f"/api/datasets/{ds}/preview").json()
+    client.post(f"/api/datasets/{ds}/publish", json={"preview_id": p["preview_id"]})
+    resp = client.post(
+        f"/api/datasets/{ds}/deliver/preview", json={"periods": ["2026-01"]}
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["new_periods"] == ["2026-01"]
+    assert data["missing"] == []
+    assert client.get(f"/api/datasets/{ds}/deliveries").json() == []

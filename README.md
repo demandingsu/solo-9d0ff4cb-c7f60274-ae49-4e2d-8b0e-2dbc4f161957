@@ -18,6 +18,7 @@ docker compose up --build
 
 首次使用：新建数据集 → 分别上传 `sample_data/mapping.csv`、`sample_data/line_forecast.csv`、
 `sample_data/published.csv` → 点击「运行校正」→ 检查「调整来源」→「发布此预览为快照」。
+发布后在同一页的「交付排产（CSV）」卡片选择时段，生成交付单。
 
 本地不带 Docker 运行：
 
@@ -27,6 +28,32 @@ pip install -r requirements.txt
 DATABASE_PATH=./app.db uvicorn app.main:create_app --factory --port 8000
 pip install -r requirements-dev.txt && pytest -q
 ```
+
+## 交付取数（给排产员）
+
+数据集页第 4 张卡片或 `/datasets/{id}/deliver` 提供交付入口。选择一组时段后生成 CSV：
+
+```csv
+period,line_id,line_name,corrected_value,snapshot_version
+2026-01,L1,冲压一线,122.500000,1
+2026-01,L2,冲压二线,157.500000,1
+```
+
+每行一个「时段 × 产线」，`corrected_value` 取快照里的校正后产线值（不是上传基线），
+`snapshot_version` 标出这一行来自哪一版快照。
+
+| 规则 | 行为 |
+| --- | --- |
+| 已交付时段 | 永远沿用**首次交付**的快照；重新发布、换版、服务重启后都不变 |
+| 新时段 | 统一锁定到**本单生效时**的最新发布快照（订单事务开始时读到的最大版本） |
+| 制表期间发布新快照 | 不影响本单：本单已解析的快照版本不会后移 |
+| 两单同时交付同一新时段 | SQLite `BEGIN IMMEDIATE` 串行化；先提交者写入锁定记录，后提交者读到并复用同一快照，两单 CSV 一致 |
+| 应取快照缺少所选时段 | 列出全部缺失时段（含应取版本），**整单退回**，不写订单/明细/锁定记录 |
+| 制表失败（缺数、结构异常） | 同样整单退回，只留一条 `delivery_rejected` 操作记录 |
+
+「预览取数」按钮只做只读预演：显示每个时段将沿用的版本或新锁定到的版本、缺哪些时段，
+不写任何数据。交付单正文随订单一起持久化，重新下载旧交付单得到的是当时那份字节不变的文件。
+单元格以 `=`/`+`/`-`/`@` 开头时会加 `'` 前缀，避免在表格软件里被当成公式。
 
 ## 校正模型
 
@@ -70,12 +97,13 @@ pip install -r requirements-dev.txt && pytest -q
 ## 页面
 
 - `/` 数据集列表
-- `/datasets/{id}` 上传、校正、发布、历史快照、操作记录
+- `/datasets/{id}` 上传、校正、发布、历史快照、交付排产、操作记录
+- `/datasets/{id}/deliver` 独立的交付取数页（也可从数据集页第 4 张卡片进入）
 - `/datasets/{id}/snapshots/{v}` 只读快照页
 - 每个时段折叠面板显示：不一致时段明细（基线 vs 已发布 vs 差额）、已发布约束、
   按节点的调整来源（`直接发布` / `层级总量` / `层级平衡`）、产线级溯源、校正后各层数值
 - 下载：`/datasets/{id}/download/snapshot.csv`、`adjustments.csv`、`conflicts.csv`
-  （带 `?version=N` 或 `?preview=N`）
+  （带 `?version=N` 或 `?preview=N`）；交付单 `/{id}/deliveries/{order}/download`
 
 ## JSON API
 
@@ -88,9 +116,14 @@ pip install -r requirements-dev.txt && pytest -q
 | POST | `/api/datasets/{id}/publish` | body `{"preview_id": N}` |
 | GET | `/api/datasets/{id}/snapshots` | 快照列表 |
 | GET | `/api/datasets/{id}/snapshots/{v}` | 快照详情 |
+| POST | `/api/datasets/{id}/deliver/preview` | 只读预演，body `{"periods": ["2026-01"]}` |
+| POST | `/api/datasets/{id}/deliver` | 生成交付单，body `{"periods": [...], "note": "..."}` |
+| GET | `/api/datasets/{id}/deliveries` | 交付单与逐时段快照版本 |
 | GET | `/healthz` | 健康检查 |
 
 错误响应：`{"error": "...", "code": "stale_preview_error"}`，HTTP 400。
+缺时段退回额外带 `missing: [{"period", "snapshot_version", "reason"}]`，
+`code` 为 `delivery_missing_periods`。
 
 ## 测试
 
@@ -100,7 +133,9 @@ pytest -q
 
 覆盖：映射成环/多父/缺层、CSV 解析、约束可行与不可行、权重变化对调整分配的影响、
 随机树与独立 KKT 解交叉验证、版本失效与旧预览拒绝发布、失败保留上一版、并发、
-HTTP 页面与下载。
+HTTP 页面与下载；交付侧覆盖首次交付锁定、换版后重叠时段仍取旧快照、新时段取生效版本、
+制表期间发布不影响本单、并发同抢新时段只锁一次且两单同版、缺时段/制表失败整单退回、
+重启后锁定仍然有效。
 
 ## 目录
 
@@ -108,13 +143,14 @@ HTTP 页面与下载。
 app/
   main.py        FastAPI 路由（页面 + JSON API）
   service.py     上传/预览/发布编排、版本与失效判定、CSV 导出
+  delivery.py    交付单：时段 → 快照解析、首次交付锁定、整单制表/退回
   reconcile.py   加权最小二乘校正与一致性校验
   hierarchy.py   树构建与结构校验
   csv_io.py      CSV 解析
   db.py          SQLite schema 与事务
   templates/     Jinja2 页面
   static/        样式
-tests/           78 项自动化测试
+tests/           96 项自动化测试
 sample_data/     可直接上传的示例文件（含一个成环反例）
 ```
 
@@ -124,5 +160,7 @@ sample_data/     可直接上传的示例文件（含一个成环反例）
 - 已发布 `line` 层级合计会锁定每条产线（合计拆分规则未定义，不擅自猜测）。
 - 不保存用户账号与权限；如需多人隔离应在反向代理层加认证。
 - 不支持按周/季度等非 ISO 周期的自然排序（按字符串前缀解析年月）。
-- 当前沙箱内没有 Docker 守护进程，`Dockerfile` / `docker-compose.yml` 已写好但未实际构建镜像；
-  应用已在本地 venv 中以 uvicorn 启动并完成上传/校正/发布/下载全链路手工验证。
+- 交付锁定是「数据集 + 时段」粒度；同一时段一旦交付就不能换到新快照（需要人工迁移的场景未实现）。
+- 当前沙箱内没有 Docker 守护进程与容器运行时，`Dockerfile` / `docker-compose.yml` 已写好但未实际构建镜像；
+  应用已在本机 venv 中以 uvicorn 启动（同一 `DATABASE_PATH`），完成上传/校正/发布/交付/缺数退回/
+  并发交付/重启后锁定复核的全链路手工验证。

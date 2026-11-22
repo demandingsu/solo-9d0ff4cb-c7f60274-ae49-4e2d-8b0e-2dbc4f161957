@@ -1,5 +1,6 @@
 {% extends "base.html" %}
 {% import "_result.html" as ui with context %}
+{% import "_delivery.html" as dl with context %}
 {% block title %}{{ dataset.name }} · 时序校正{% endblock %}
 {% block content %}
 <section class="card dataset-head">
@@ -8,6 +9,7 @@
     <p class="muted">数据集 #{{ dataset.id }} · 当前输入版本 <span class="pill">v{{ dataset.input_version }}</span></p>
   </div>
   <div class="head-actions">
+    <a class="button" href="#delivery">交付排产 CSV</a>
     <a class="button ghost" href="/">返回列表</a>
   </div>
 </section>
@@ -17,6 +19,13 @@
 {% endif %}
 {% if request.query_params.get('published') %}
 <div class="banner banner-ok">已发布快照 v{{ request.query_params.get('published') }}，可在下方历史快照中查看。</div>
+{% endif %}
+{% if request.query_params.get('delivered') %}
+<div class="banner banner-ok">
+  已生成交付单 #{{ request.query_params.get('delivered') }}，时段：
+  <span class="mono">{{ request.query_params.get('periods') }}</span>。
+  <a href="/datasets/{{ dataset.id }}/deliveries/{{ request.query_params.get('delivered') }}/download">下载本次 CSV</a>
+</div>
 {% endif %}
 
 <section class="grid two">
@@ -131,6 +140,8 @@
   {{ ui.result_tables(latest_snapshot.result, dataset.id, download_version=latest_snapshot.version_number) }}
 </section>
 {% endif %}
+
+{{ dl.delivery_card(dataset, deliveries, delivery_locks, available_periods, delivery_attempt=delivery_attempt) }}
 
 <section class="card">
   <h2>操作记录</h2>

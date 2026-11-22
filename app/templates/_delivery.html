@@ -1,0 +1,127 @@
+{% macro delivery_card(dataset, deliveries, delivery_locks, available_periods, delivery=None, delivery_attempt=None, show_records=True) %}
+<div class="card" id="delivery">
+  <h2>4. 交付排产（CSV）</h2>
+  <p class="muted">
+    选择一组时段下载 CSV，列为 <span class="mono">period, line_id, line_name, corrected_value, snapshot_version</span>。
+    已交付的时段始终沿用<strong>首次交付</strong>的快照，换版或重启后不变；
+    新时段锁定到本单生效时的最新发布快照。整单要么全部出数，要么全部退回。
+  </p>
+
+  {% if delivery_attempt and delivery_attempt.missing %}
+  <div class="banner banner-error">
+    <strong>整单已退回，本次不新增锁定记录。</strong>
+    以下时段在应取的快照中不存在：
+    <ul>
+      {% for m in delivery_attempt.missing %}
+      <li>
+        <span class="mono">{{ m.period }}</span>
+        · 应取快照 {% if m.snapshot_version %}v{{ m.snapshot_version }}{% else %}—{% endif %}
+        · {{ m.reason }}
+      </li>
+      {% endfor %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% if delivery %}
+  <div class="banner {% if delivery.missing %}banner-error{% else %}banner-ok{% endif %}">
+    {% if delivery.latest_snapshot_version %}
+    <strong>生效快照 v{{ delivery.latest_snapshot_version }}</strong>
+    {% else %}
+    <strong>尚无已发布快照</strong>
+    {% endif %}
+    {% if delivery.last_delivered_version %} · 上次交付最高快照 v{{ delivery.last_delivered_version }}{% endif %}
+    <div class="chips mt-sm">
+      {% for p in delivery.periods %}
+        {% set pinned_v = delivery.pinned.get(p) %}
+        <span class="chip {% if p in delivery.new_periods %}chip-new{% else %}chip-pinned{% endif %}">
+          {{ p }}
+          {% if pinned_v %}· 沿用 v{{ pinned_v }}
+          {% elif delivery.latest_snapshot_version %}· 新锁定 v{{ delivery.latest_snapshot_version }}
+          {% else %}· 待发布快照{% endif %}
+        </span>
+      {% endfor %}
+    </div>
+    {% if delivery.missing %}
+      <p class="mt-sm"><strong>缺失时段（在应取的快照中不存在）：</strong>
+        {% for m in delivery.missing %}{{ m.period }}{% if m.snapshot_version %}（v{{ m.snapshot_version }}）{% endif %}{% if not loop.last %}、{% endif %}{% endfor %}
+      </p>
+    {% endif %}
+    {% for w in delivery.warnings %}<p class="small muted mt-sm">{{ w }}</p>{% endfor %}
+  </div>
+  {% endif %}
+
+  <form method="post" action="/datasets/{{ dataset.id }}/deliver/preview" class="deliver-form">
+    <input type="hidden" name="request_key" value="{{ delivery_request_key }}">
+    <div class="field">
+      <label for="periods">时段（逗号或空格分隔）</label>
+      <input type="text" id="periods" name="periods" required
+             value="{{ (delivery.periods|join(', ')) if delivery else '' }}"
+             placeholder="例如：2026-01, 2026-02">
+      {% if available_periods %}
+      <p class="muted small">当前可选时段：
+        {% for p in available_periods %}<code class="period-chip">{{ p }}</code>{% endfor %}
+      </p>
+      {% else %}
+      <p class="muted small">尚无可用时段，请先发布快照。</p>
+      {% endif %}
+    </div>
+    <div class="row">
+      <button type="submit" class="ghost">预览取数</button>
+      <button type="submit" formaction="/datasets/{{ dataset.id }}/deliver" class="primary"
+              {% if not available_periods %}disabled{% endif %}>
+        生成并记录交付单
+      </button>
+    </div>
+  </form>
+
+  {% if show_records %}
+  <h3 class="mt">已交付快照锁定</h3>
+  {% if delivery_locks %}
+  <table class="compact">
+    <thead><tr><th>时段</th><th>锁定快照</th><th>交付单</th><th>锁定时间</th></tr></thead>
+    <tbody>
+    {% for period, lock in delivery_locks.items() %}
+      <tr>
+        <td class="mono">{{ period }}</td>
+        <td><span class="pill pill-ok">v{{ lock.snapshot_version }}</span></td>
+        <td>#{{ lock.order_id }}</td>
+        <td class="mono">{{ lock.created_at }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="muted">还没有锁定的时段。</p>
+  {% endif %}
+
+  <h3 class="mt">交付记录</h3>
+  {% if deliveries %}
+  <table class="compact">
+    <thead>
+      <tr><th>交付单</th><th>时间</th><th>时段</th><th class="num">行数</th><th>新锁定</th><th></th></tr>
+    </thead>
+    <tbody>
+    {% for o in deliveries %}
+      <tr>
+        <td>#{{ o.id }}</td>
+        <td class="mono">{{ o.created_at }}</td>
+        <td>
+          {% for item in o["items"] %}
+            <span class="chip small">{{ item.period }} · v{{ item.snapshot_version }}
+              {%- if item.locked_now %} <span class="tag tag-pub">新锁定</span>{% endif %}</span>
+          {% endfor %}
+        </td>
+        <td class="num">{{ o.row_count }}</td>
+        <td>{{ o.new_periods|length }} 个（生效快照 v{{ o.latest_snapshot_version }}）</td>
+        <td><a href="/datasets/{{ dataset.id }}/deliveries/{{ o.id }}/download">下载 CSV</a></td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+    <p class="muted">还没有交付记录。</p>
+  {% endif %}
+  {% endif %}
+</div>
+{% endmacro %}

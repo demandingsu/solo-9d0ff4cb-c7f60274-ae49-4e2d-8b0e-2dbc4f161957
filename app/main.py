@@ -3,17 +3,24 @@
 from __future__ import annotations
 
 import os
+import secrets
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import FastAPI, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    RedirectResponse,
+    Response,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from . import delivery as delivery_module
 from .db import Database
-from .errors import ReconciliationError
+from .errors import MissingPeriodsError, PublishError, ReconciliationError
 from .service import (
     KIND_LABELS,
     ReconciliationService,
@@ -35,19 +42,57 @@ def create_app(db_path: str | None = None) -> FastAPI:
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
     app.mount("/static", StaticFiles(directory=str(BASE_DIR / "static")), name="static")
 
+    def available_periods(dataset_id: int) -> list[str]:
+        """Periods the scheduler can pick: latest snapshot plus pinned ones."""
+        from .reconcile import _period_sort_key
+
+        latest = database.get_snapshot(dataset_id)
+        periods: set[str] = set()
+        if latest is not None:
+            periods.update(
+                p.period
+                for p in ReconciliationResult.from_dict(latest["result"]).periods
+            )
+        snapshots: dict[int, Any] = {}
+        for lock in database.delivery_locks(dataset_id).values():
+            version = lock["snapshot_version"]
+            if version == (latest or {}).get("version_number"):
+                continue
+            if version not in snapshots:
+                snapshots[version] = database.get_snapshot(dataset_id, version)
+            snapshot = snapshots[version]
+            if snapshot is not None:
+                periods.update(
+                    p.period
+                    for p in ReconciliationResult.from_dict(snapshot["result"]).periods
+                )
+        return sorted(periods, key=_period_sort_key)
+
     def state_for(request: Request, dataset_id: int, **extra: Any) -> dict[str, Any]:
         state = service.dataset_state(dataset_id)
-        state.update({"request": request, "kind_labels": KIND_LABELS, **extra})
+        state.update(
+            {
+                "request": request,
+                "kind_labels": KIND_LABELS,
+                "deliveries": database.list_delivery_orders(dataset_id),
+                "delivery_locks": database.delivery_locks(dataset_id),
+                "available_periods": available_periods(dataset_id),
+                # One key per rendered form: a double-submit replays the same
+                # order instead of creating a second one.
+                "delivery_request_key": secrets.token_hex(12),
+                **extra,
+            }
+        )
         return state
 
     @app.exception_handler(ReconciliationError)
     async def handle_reconciliation_error(request: Request, exc: ReconciliationError):
         wants_json = request.url.path.startswith("/api/")
         if wants_json:
-            return JSONResponse(
-                status_code=400,
-                content={"error": str(exc), "code": exc.code},
-            )
+            content: dict[str, Any] = {"error": str(exc), "code": exc.code}
+            if isinstance(exc, MissingPeriodsError):
+                content["missing"] = exc.missing
+            return JSONResponse(status_code=400, content=content)
         dataset_id = request.path_params.get("dataset_id")
         if dataset_id is None or database.get_dataset(int(dataset_id)) is None:
             return templates.TemplateResponse(
@@ -56,10 +101,13 @@ def create_app(db_path: str | None = None) -> FastAPI:
                 {"message": str(exc), "code": exc.code, "title": "操作失败"},
                 status_code=400,
             )
+        extra: dict[str, Any] = {"error": str(exc), "error_code": exc.code}
+        if isinstance(exc, MissingPeriodsError):
+            extra["delivery_attempt"] = {"missing": exc.missing}
         return templates.TemplateResponse(
             request,
             "dataset.html",
-            state_for(request, int(dataset_id), error=str(exc), error_code=exc.code),
+            state_for(request, int(dataset_id), **extra),
             status_code=400,
         )
 
@@ -123,6 +171,68 @@ def create_app(db_path: str | None = None) -> FastAPI:
         return RedirectResponse(
             url=f"/datasets/{dataset_id}?published={published['version_number']}",
             status_code=303,
+        )
+
+    # ------------------------------------------------------------------
+    # Delivery (scheduler CSV hand-off)
+    # ------------------------------------------------------------------
+    @app.post("/datasets/{dataset_id}/deliver/preview")
+    def deliver_preview(
+        request: Request,
+        dataset_id: int,
+        periods: str = Form(""),
+        request_key: str = Form(""),
+    ):
+        if database.get_dataset(dataset_id) is None:
+            raise HTTPException(status_code=404, detail="数据集不存在")
+        parsed = delivery_module.parse_periods(periods)
+        preview = delivery_module.resolve(database, dataset_id, parsed)
+        return templates.TemplateResponse(
+            request,
+            "deliver.html",
+            {
+                "request": request,
+                "dataset": database.get_dataset(dataset_id),
+                "periods_text": periods,
+                "delivery": preview.to_dict(),
+                "available_periods": available_periods(dataset_id),
+                "delivery_locks": database.delivery_locks(dataset_id),
+                "delivery_request_key": request_key or secrets.token_hex(12),
+                "error": None,
+            },
+        )
+
+    @app.post("/datasets/{dataset_id}/deliver")
+    def deliver(
+        dataset_id: int,
+        periods: str = Form(""),
+        request_key: str = Form(""),
+    ):
+        if database.get_dataset(dataset_id) is None:
+            raise HTTPException(status_code=404, detail="数据集不存在")
+        parsed = delivery_module.parse_periods(periods)
+        order = delivery_module.deliver(
+            database, dataset_id, parsed, request_key=request_key.strip() or None
+        )
+        periods_q = quote(",".join(order["periods"]))
+        return RedirectResponse(
+            url=f"/datasets/{dataset_id}?delivered={order['order_id']}&periods={periods_q}",
+            status_code=303,
+        )
+
+    @app.get("/datasets/{dataset_id}/deliveries/{order_id}/download")
+    def download_delivery(dataset_id: int, order_id: int):
+        order = database.get_delivery_order(dataset_id, order_id)
+        if order is None:
+            raise HTTPException(status_code=404, detail="交付单不存在")
+        return Response(
+            content="﻿" + order["csv_text"],
+            media_type="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="delivery-order-{order_id}-d{dataset_id}.csv"'
+                )
+            },
         )
 
     @app.get("/datasets/{dataset_id}/snapshots/{version_number}", response_class=HTMLResponse)
@@ -234,6 +344,30 @@ def create_app(db_path: str | None = None) -> FastAPI:
         if snapshot is None:
             raise HTTPException(status_code=404, detail="快照不存在")
         return snapshot
+
+    @app.post("/api/datasets/{dataset_id}/deliver/preview")
+    def api_deliver_preview(dataset_id: int, payload: dict[str, Any]):
+        if database.get_dataset(dataset_id) is None:
+            raise PublishError("数据集不存在。")
+        periods = delivery_module.parse_periods(payload.get("periods"))
+        return delivery_module.resolve(database, dataset_id, periods).to_dict()
+
+    @app.post("/api/datasets/{dataset_id}/deliver")
+    def api_deliver(dataset_id: int, payload: dict[str, Any]):
+        periods = delivery_module.parse_periods(payload.get("periods"))
+        order = delivery_module.deliver(
+            database,
+            dataset_id,
+            periods,
+            note=str(payload.get("note", "")),
+            request_key=str(payload.get("request_key") or "") or None,
+        )
+        order.pop("csv_text", None)
+        return order
+
+    @app.get("/api/datasets/{dataset_id}/deliveries")
+    def api_deliveries(dataset_id: int):
+        return database.list_delivery_orders(dataset_id)
 
     @app.get("/healthz")
     def healthz():
